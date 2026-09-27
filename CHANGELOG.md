@@ -8,6 +8,7 @@
 - Add bilingual README files and VitePress documentation.
 - Add reusable SVG identity assets for README and docs.
 - Add GitHub Pages deployment workflow.
+- Add selecting individual displays.
 
 ## 0.1.0
 
