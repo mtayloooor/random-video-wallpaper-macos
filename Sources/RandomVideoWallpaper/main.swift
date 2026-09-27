@@ -13,6 +13,7 @@ private struct Options {
     var recursive = true
     var muted = true
     var onlyMainScreen = false
+    var disabledDisplays: Set<String> = []
     var videoGravity: AVLayerVideoGravity = .resizeAspectFill
     var fadeDuration: TimeInterval = 1.2
     var levelOffset = 0
@@ -41,6 +42,7 @@ private enum VideoWallpaperError: Error, CustomStringConvertible {
 
 private enum DefaultsKeys {
     static let lastInputs = "lastInputs"
+    static let disabledDisplays = "disabledDisplays"
 }
 
 private final class Playlist {
@@ -64,6 +66,17 @@ private final class Playlist {
 
         lastURL = candidate
         return candidate
+    }
+}
+
+private extension NSScreen {
+    /// Stable identifier that survives reconnects and restarts, unlike the display ID.
+    var displayUUID: String? {
+        guard let displayID = deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID,
+              let uuid = CGDisplayCreateUUIDFromDisplayID(displayID)?.takeRetainedValue() else {
+            return nil
+        }
+        return CFUUIDCreateString(nil, uuid) as String
     }
 }
 
@@ -296,6 +309,9 @@ private final class AppController: NSObject, NSApplicationDelegate {
     init(playlist: Playlist?, options: Options) {
         self.playlist = playlist
         self.options = options
+        self.options.disabledDisplays = Set(
+            UserDefaults.standard.stringArray(forKey: DefaultsKeys.disabledDisplays) ?? []
+        )
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -344,18 +360,27 @@ private final class AppController: NSObject, NSApplicationDelegate {
 
     private func rebuildScenes() {
         guard let playlist else {
+            rebuildMenu()
             return
         }
 
         scenes.forEach { $0.close() }
         let screens = options.onlyMainScreen
             ? NSScreen.main.map { [$0] } ?? NSScreen.screens
-            : NSScreen.screens
+            : enabledScreens()
 
         scenes = screens.map {
             WallpaperScene(screen: $0, playlist: playlist, options: options)
         }
         rebuildMenu()
+    }
+
+    /// Connected screens the user hasn't turned off, falling back to all screens so something always plays.
+    private func enabledScreens() -> [NSScreen] {
+        let enabled = NSScreen.screens.filter { screen in
+            screen.displayUUID.map { !options.disabledDisplays.contains($0) } ?? true
+        }
+        return enabled.isEmpty ? NSScreen.screens : enabled
     }
 
     private func orderScenes() {
@@ -417,6 +442,12 @@ private final class AppController: NSObject, NSApplicationDelegate {
         onlyMain.state = options.onlyMainScreen ? .on : .off
         statusMenu.addItem(onlyMain)
 
+        if !options.onlyMainScreen {
+            let displays = NSMenuItem(title: "Displays", action: nil, keyEquivalent: "")
+            displays.submenu = displaysMenu()
+            statusMenu.addItem(displays)
+        }
+
         let fit = menuItem("Fit Instead of Fill", #selector(toggleFitMode), "")
         fit.state = options.videoGravity == .resizeAspect ? .on : .off
         statusMenu.addItem(fit)
@@ -427,6 +458,29 @@ private final class AppController: NSObject, NSApplicationDelegate {
         statusMenu.addItem(.separator())
 
         statusMenu.addItem(menuItem("Quit", #selector(quit), "q"))
+    }
+
+    private func displaysMenu() -> NSMenu {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        let enabled = enabledScreens()
+        let enabledCount = enabled.count
+
+        for screen in NSScreen.screens {
+            guard let displayUUID = screen.displayUUID else {
+                continue
+            }
+
+            let item = menuItem(screen.localizedName, #selector(toggleDisplay(_:)), "")
+            item.representedObject = displayUUID
+            let isEnabled = enabled.contains(screen)
+            item.state = isEnabled ? .on : .off
+            // Keep at least one display playing.
+            item.isEnabled = !(isEnabled && enabledCount <= 1)
+            menu.addItem(item)
+        }
+
+        return menu
     }
 
     private func menuItem(_ title: String, _ action: Selector, _ keyEquivalent: String) -> NSMenuItem {
@@ -492,6 +546,23 @@ private final class AppController: NSObject, NSApplicationDelegate {
 
     @objc private func toggleOnlyMainScreen() {
         options.onlyMainScreen.toggle()
+        rebuildScenes()
+        rebuildMenu()
+    }
+
+    @objc private func toggleDisplay(_ sender: NSMenuItem) {
+        guard let displayUUID = sender.representedObject as? String else {
+            return
+        }
+
+        if sender.state == .on {
+            // Displays shown as on must not stay in the disabled set (e.g. after the fallback kicks in).
+            options.disabledDisplays.subtract(enabledScreens().compactMap(\.displayUUID))
+            options.disabledDisplays.insert(displayUUID)
+        } else {
+            options.disabledDisplays.remove(displayUUID)
+        }
+        UserDefaults.standard.set(Array(options.disabledDisplays).sorted(), forKey: DefaultsKeys.disabledDisplays)
         rebuildScenes()
         rebuildMenu()
     }
